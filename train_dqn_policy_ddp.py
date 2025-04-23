@@ -23,18 +23,23 @@ ENV_NAME = 'Blackjack-v1'
 DEFAULT_MODEL_FILENAME = "blackjack_dqn_policy_ddp_50m.pth"
 DEFAULT_CHECKPOINT_FILE = "dqn_checkpoint_ddp.pth"
 MANUAL_CHECKPOINT_TRIGGER = "save_checkpoint_ddp.trigger" # Separate trigger
-NUM_EPISODES = 50_000_000 # Per process, effectively? Or total? Let's aim for total.
-BATCH_SIZE = 1024 # Per GPU batch size
+NUM_EPISODES = 500_000 # Per process, effectively? Or total? Let's aim for total.
+BATCH_SIZE = 512 # Per GPU batch size
 GAMMA = 0.99
 EPS_START = 1.0
 EPS_END = 0.05
-EPS_DECAY = 2_000_000 # Needs careful tuning with DDP - faster training might need faster decay
+# << Adjusted EPS_DECAY for multi-GPU experience rate >>
+# Original was 2_000_000. Divide by estimated GPU count (needs world_size later)
+# Let's define it lower globally, or adjust dynamically in main_worker
+BASE_EPS_DECAY = 2_000_000 
 TAU = 0.005
 LR = 1e-4 # Learning Rate
 BUFFER_SIZE = 500_000 # Per process buffer size
-CHECKPOINT_INTERVAL = 1_000_000 # Total episodes checkpoint interval
+CHECKPOINT_INTERVAL = 10_000 # Total episodes checkpoint interval
 REPORT_INTERVAL = 1000 # Logging interval (rank 0 only)
 PRINT_INTERVAL = 10000 # Newline interval (rank 0 only)
+# << Gradient Accumulation >>
+GRADIENT_ACCUMULATION_STEPS = 8
 
 # --- Helper function to find free port ---
 def find_free_port():
@@ -47,19 +52,19 @@ def find_free_port():
 # --- DDP Setup/Cleanup ---
 def setup(rank, world_size, port): # Accept port argument
     os.environ['MASTER_ADDR'] = 'localhost'
-    # Use the dynamically found port
-    os.environ['MASTER_PORT'] = str(port) 
-    
-    # Determine backend based on OS or availability (using gloo for Windows/compatibility)
-    # backend = 'nccl' if torch.distributed.is_nccl_available() else 'gloo'
-    # Forcing gloo as NCCL isn't built-in on this Windows setup
-    backend = 'gloo'
-    
-    print(f"Rank {rank} initializing process group with backend: {backend}") # Log backend
+    os.environ['MASTER_PORT'] = str(port)
+
+    # Use NCCL backend for Linux/NVIDIA
+    backend = 'nccl'
+    if not torch.distributed.is_nccl_available():
+        print(f"Warning: NCCL backend not available, falling back to gloo (Performance may suffer)")
+        backend = 'gloo'
+
+    print(f"Rank {rank} initializing process group with backend: {backend}")
     # Initialize the process group
     dist.init_process_group(backend, rank=rank, world_size=world_size)
-    if backend == 'nccl' or torch.cuda.is_available(): # Only set device if using CUDA
-        torch.cuda.set_device(rank) # Pin the process to a specific GPU if using CUDA
+    if backend == 'nccl': # Only pin device for NCCL
+        torch.cuda.set_device(rank) # Pin the process to a specific GPU
 
 def cleanup():
     dist.destroy_process_group()
@@ -102,7 +107,7 @@ class ReplayBuffer:
     def __len__(self):
         return len(self.memory)
 
-# --- DQN Agent (Modified for DDP + AMP) ---
+# --- DQN Agent (Modified for Gradient Accumulation) ---
 class DQNAgent:
     # Removed env dependency from init, pass device=rank
     def __init__(self, n_observations, n_actions, rank, buffer_capacity=BUFFER_SIZE, lr=LR):
@@ -122,6 +127,8 @@ class DQNAgent:
         self.steps_done = 0 # Track steps per process for epsilon decay
         # << Use new torch.amp API >>
         self.scaler = torch.amp.GradScaler('cuda')
+        # << Counter for gradient accumulation >>
+        self.accum_step_counter = 0
 
     # Wrap policy net with DDP after potential loading
     def wrap_policy_net_ddp(self):
@@ -129,32 +136,27 @@ class DQNAgent:
          self.policy_net = DDP(self.policy_net, device_ids=[self.rank], find_unused_parameters=False)
 
 
-    def select_action(self, state, env_action_space): # Pass env action space
+    def select_action(self, state, env_action_space, eps_threshold): # Accept eps_threshold
         sample = random.random()
-        eps_threshold = EPS_END + (EPS_START - EPS_END) * \
-            np.exp(-1. * self.steps_done / EPS_DECAY)
-        self.steps_done += 1 # Increment steps done for this process
+        # Epsilon decay logic is now handled *outside* this function
+        # self.steps_done is still incremented outside for tracking
         
-        # Ensure state is a tensor on the correct device
         state_tensor = torch.tensor(state, dtype=torch.float32, device=self.rank).unsqueeze(0)
         
         if sample > eps_threshold:
             with torch.no_grad():
-                # Use policy_net directly (it's wrapped in DDP)
-                # DDP wrapper handles the forward pass correctly
                 q_values = self.policy_net(state_tensor) 
                 return q_values.max(1)[1].view(1, 1)
         else:
-            # Sample action randomly, create tensor on correct device
             return torch.tensor([[env_action_space.sample()]], device=self.rank, dtype=torch.long)
 
-    def optimize_model(self, batch_size=BATCH_SIZE, gamma=GAMMA):
+    def optimize_model(self, batch_size=BATCH_SIZE, gamma=GAMMA, grad_accum_steps=GRADIENT_ACCUMULATION_STEPS):
         if len(self.memory) < batch_size:
-            return None
+            return None, False # Return loss, and bool indicating if optimizer stepped
             
         transitions = self.memory.sample(batch_size)
         if not transitions:
-             return None
+             return None, False
              
         batch = Transition(*zip(*transitions))
 
@@ -167,40 +169,41 @@ class DQNAgent:
         action_batch = torch.cat(batch.action) 
         reward_batch = torch.tensor(batch.reward, dtype=torch.float32, device=self.rank)
         
-        # << Use new torch.amp API and fix dtype >>
+        optimizer_stepped = False
         with torch.amp.autocast(device_type='cuda'):
-            # Policy network forward pass
             state_action_values = self.policy_net(state_batch).gather(1, action_batch)
-
-            # Target network forward pass for next state values
-            next_state_values = torch.zeros(len(transitions), device=self.rank) # Keep as float32
+            next_state_values = torch.zeros(len(transitions), device=self.rank)
             if len(non_final_next_states_list) > 0:
                  non_final_next_states = torch.tensor(np.array(non_final_next_states_list), 
                                                    dtype=torch.float32, device=self.rank)
                  with torch.no_grad():
-                      # << Cast target net output back to float before assignment >>
                       next_state_values[non_final_mask] = self.target_net(non_final_next_states).max(1)[0].float()
-                    
-            # Compute the expected Q values (results will be float32)
+            
             expected_state_action_values = (next_state_values * gamma) + reward_batch
-
-            # Compute loss 
             criterion = nn.SmoothL1Loss()
-            # Loss input needs to be consistent, should be float32 here
             loss = criterion(state_action_values.float(), expected_state_action_values.unsqueeze(1))
+            
+            # << Scale loss for accumulation >>
+            loss = loss / grad_accum_steps
 
-        # << GradScaler usage remains the same >>
-        self.optimizer.zero_grad()
+        # Accumulate scaled gradients
         self.scaler.scale(loss).backward() 
+        self.accum_step_counter += 1
+
+        # Perform optimizer step only after accumulating gradients for N steps
+        if self.accum_step_counter % grad_accum_steps == 0:
+            # Unscale gradients before clipping (optional but can be safer)
+            self.scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_value_(self.policy_net.parameters(), 100) 
+            
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            self.optimizer.zero_grad() # Zero gradients ONLY after optimizer step
+            optimizer_stepped = True
+            # Reset counter after step (optional, modulus handles it)
+            # self.accum_step_counter = 0 
         
-        # Optional: Unscale gradients before clipping (sometimes needed)
-        # self.scaler.unscale_(self.optimizer)
-        torch.nn.utils.clip_grad_value_(self.policy_net.parameters(), 100) 
-        
-        self.scaler.step(self.optimizer)
-        self.scaler.update()
-        
-        return loss.item()
+        return loss.item() * grad_accum_steps, optimizer_stepped # Return unscaled loss, and if step occurred
 
     def update_target_network(self, tau=TAU):
         target_net_state_dict = self.target_net.state_dict()
@@ -286,6 +289,7 @@ def main_worker(rank, world_size, port, model_filename, checkpoint_file): # Acce
     setup(rank, world_size, port) # Pass port to setup
     if rank == 0:
         print(f"=== Starting DDP Training with {world_size} GPUs on Port {port} ===") # Log the port used
+        print(f"Gradient Accumulation Steps: {GRADIENT_ACCUMULATION_STEPS}")
 
     # Each process gets its own environment instance
     # Seed environment differently per process? Might help exploration.
@@ -297,6 +301,11 @@ def main_worker(rank, world_size, port, model_filename, checkpoint_file): # Acce
     n_observations = 3 # Specific to Blackjack state representation
     n_actions = env.action_space.n
     
+    # << Adjust Epsilon Decay based on world size >>
+    effective_eps_decay = BASE_EPS_DECAY / world_size
+    if rank == 0:
+        print(f"Base EPS_DECAY: {BASE_EPS_DECAY}, Effective EPS_DECAY: {effective_eps_decay:.0f}")
+
     agent = DQNAgent(n_observations, n_actions, rank)
 
     # Load checkpoint *before* wrapping policy_net with DDP
@@ -308,6 +317,7 @@ def main_worker(rank, world_size, port, model_filename, checkpoint_file): # Acce
 
     episode_rewards = [] # Track rewards per process
     episode_losses = [] # Track losses per process
+    total_optimizer_steps = 0 # Track actual optimizer steps
 
     if rank == 0: # Only rank 0 tracks global time and episode counts for logging
         start_time = time.time()
@@ -332,11 +342,19 @@ def main_worker(rank, world_size, port, model_filename, checkpoint_file): # Acce
         state, _ = env.reset()
         done = False
         total_reward = 0
-        total_loss = 0
-        steps_in_episode = 0
+        total_loss_in_episode = 0
+        batches_in_episode = 0
+        optimizer_steps_in_episode = 0
         
         while not done:
-            action_tensor = agent.select_action(state, env.action_space)
+            # << Pass effective_eps_decay to select_action >>
+            # Needs modification in DQNAgent.select_action to accept this
+            # OR: Calculate eps_threshold here directly using agent.steps_done and effective_eps_decay
+            eps_threshold = EPS_END + (EPS_START - EPS_END) * \
+                 np.exp(-1. * agent.steps_done / effective_eps_decay)
+            agent.steps_done += 1 # Still increment per action/experience
+            
+            action_tensor = agent.select_action(state, env.action_space, eps_threshold) # Modify select_action
             action = action_tensor.item()
             
             next_state, reward, terminated, truncated, _ = env.step(action)
@@ -346,24 +364,30 @@ def main_worker(rank, world_size, port, model_filename, checkpoint_file): # Acce
             agent.memory.push(state, action_tensor, next_state if not done else None, reward, done)
             state = next_state
             
-            loss = agent.optimize_model()
-            if loss is not None:
-                 total_loss += loss
-                 steps_in_episode += 1
-
-            # Update target network frequently (can be tuned)
-            agent.update_target_network() 
+            # Perform optimization step (or gradient accumulation)
+            loss, optimizer_stepped = agent.optimize_model()
             
+            if loss is not None:
+                 total_loss_in_episode += loss
+                 batches_in_episode += 1
+
+            # << Update target network only when optimizer steps >>
+            if optimizer_stepped:
+                 agent.update_target_network()
+                 optimizer_steps_in_episode += 1
+
             if done:
                 break
+        
+        total_optimizer_steps += optimizer_steps_in_episode
         
         # --- Logging and Checkpointing (Rank 0 only) ---
         # Processes need to communicate results (e.g., avg reward/loss) to Rank 0 for accurate global logging
         # Simple approach: Rank 0 logs its own progress as an indicator
         if rank == 0:
             episode_rewards.append(total_reward)
-            avg_loss = total_loss / steps_in_episode if steps_in_episode > 0 else 0
-            episode_losses.append(avg_loss)
+            avg_loss_in_episode = total_loss_in_episode / batches_in_episode if batches_in_episode > 0 else 0
+            episode_losses.append(avg_loss_in_episode)
             
             # Use estimated global episode for reporting and checkpointing
             estimated_total_episodes_done = current_global_episode # Use the estimated global count
@@ -395,7 +419,8 @@ def main_worker(rank, world_size, port, model_filename, checkpoint_file): # Acce
                 est_total_time = time_per_episode_rank0 * (NUM_EPISODES - start_episode)
                 est_remaining_time = est_total_time - elapsed_time
 
-                print(f"\rEp {estimated_total_episodes_done:,}/{NUM_EPISODES:,} | Avg Rwd (Rank 0, {REPORT_INTERVAL} ep): {avg_reward:.3f} | Avg Loss (Rank 0): {avg_loss_last_interval:.5f} | Steps (Rank 0): {agent.steps_done:,} | Time: {elapsed_time:.1f}s | ETA: {est_remaining_time/3600:.1f} hrs", end="")
+                # Add optimizer steps to log
+                print(f"\rEp {estimated_total_episodes_done:,}/{NUM_EPISODES:,} | Avg Rwd (Rank 0): {avg_reward:.3f} | Avg Loss (Rank 0): {avg_loss_last_interval:.5f} | Opt Steps(R0): {total_optimizer_steps:,} | Time: {elapsed_time:.1f}s | ETA: {est_remaining_time/3600:.1f} hrs", end="")
             
             if estimated_total_episodes_done % PRINT_INTERVAL == 0:
                  print()

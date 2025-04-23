@@ -79,6 +79,52 @@ python strategy_advisor.py
 5. The recommended action (HIT or STAND), based on the DQN model's prediction, will be displayed.
 6. Use "Clear Hand" to reset the player and dealer cards.
 
+## Multi‑GPU DataParallel Training
+
+If you have multiple CUDA-enabled GPUs and want to train the Blackjack DQN on all of them simultaneously without the complexity of DDP, you can use the provided `train_dqn_policy_dp.py` script which leverages PyTorch's `DataParallel`.
+
+### Prerequisites
+
+1. Ensure you have Python 3.8+ and a CUDA-enabled GPU setup.
+2. Create and activate a virtual environment:
+   ```bash
+   python3 -m venv venv
+   source venv/bin/activate
+   ```
+3. Install the Python dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
+4. Install PyTorch with the CUDA build matching your drivers (for CUDA 12.1):
+   ```bash
+   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+   ```
+
+### Running with DataParallel
+
+This script replicates the model onto each GPU, splits each minibatch across GPUs, and gathers gradients automatically.
+
+```bash
+python train_dqn_policy_dp.py
+```
+
+By default:
+- Uses `PER_GPU_BATCH` per GPU, for a global batch size of `PER_GPU_BATCH * num_gpus`.
+- Saves automatic checkpoints every `CHECKPOINT_INTERVAL` episodes to `dp_dqn_checkpoint.pth`.
+- To force a manual checkpoint at any time, create the trigger file:
+  ```bash
+  touch save_trigger.trigger
+  ```
+  The script will detect it, save a checkpoint named `manual_ep<N>.pth`, and remove the trigger.
+
+### Output
+
+- `dp_dqn_checkpoint.pth` – latest automatic checkpoint
+- `manual_ep<N>.pth` – manual checkpoint at episode N
+- `dp_dqn_policy.pth` – final trained model weights
+
+Refer back to the original sections above for single‑GPU training or the GUI usage.
+
 ## Pushing to GitHub
 
 To push this project to your GitHub repository (`https://github.com/aaddyy227/promakoo.git`):

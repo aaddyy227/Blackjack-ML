@@ -15,11 +15,11 @@ MODEL_FILENAME = "blackjack_dqn_policy_50m.pth"
 CHECKPOINT_FILE = "dqn_checkpoint.pth"
 MANUAL_CHECKPOINT_TRIGGER = "save_checkpoint.trigger"
 NUM_EPISODES = 50_000_000
-BATCH_SIZE = 128
+BATCH_SIZE = 512
 GAMMA = 0.99
 EPS_START = 1.0
 EPS_END = 0.05
-EPS_DECAY = 2_000_000
+EPS_DECAY = 1_500_000
 TAU = 0.005
 LR = 1e-4
 BUFFER_SIZE = 500_000
@@ -69,7 +69,7 @@ class DQNAgent:
         self.device = device
         self.n_actions = env.action_space.n
         # Observation space is Tuple(Discrete(32), Discrete(11), Discrete(2))
-        # We represent it as a 3-element vector
+        # We reent it as a 3-element vector
         self.n_observations = 3 
         
         self.policy_net = DQN(self.n_observations, self.n_actions).to(self.device)
@@ -80,6 +80,7 @@ class DQNAgent:
         self.optimizer = optim.AdamW(self.policy_net.parameters(), lr=LR, amsgrad=True)
         self.memory = ReplayBuffer(BUFFER_SIZE)
         self.steps_done = 0
+        self.scaler = torch.amp.GradScaler('cuda', enabled=torch.cuda.is_available())
 
     def select_action(self, state):
         sample = random.random()
@@ -95,7 +96,9 @@ class DQNAgent:
                 # t.max(1) will return largest column value of each row.
                 # second column on max result is index of where max element was
                 # found, so we pick action with the larger expected reward.
-                return self.policy_net(state_tensor).max(1)[1].view(1, 1)
+                with torch.amp.autocast(device_type=self.device.type, enabled=self.scaler.is_enabled()):
+                    q_values = self.policy_net(state_tensor)
+                    return q_values.max(1)[1].view(1, 1)
         else:
             return torch.tensor([[self.env.action_space.sample()]], device=self.device, dtype=torch.long)
 
@@ -129,7 +132,8 @@ class DQNAgent:
         # Compute Q(s_t, a) - the model computes Q(s_t), then we select the
         # columns of actions taken. These are the actions which would've been taken
         # for each batch state according to policy_net
-        state_action_values = self.policy_net(state_batch).gather(1, action_batch)
+        with torch.amp.autocast(device_type=self.device.type, enabled=self.scaler.is_enabled()):
+            state_action_values = self.policy_net(state_batch).gather(1, action_batch)
 
         # Compute V(s_{t+1}) for all next states.
         # Expected values of actions for non_final_next_states are computed based
@@ -139,21 +143,21 @@ class DQNAgent:
         next_state_values = torch.zeros(BATCH_SIZE, device=self.device)
         if len(non_final_next_states_list) > 0:
             with torch.no_grad():
-                next_state_values[non_final_mask] = self.target_net(non_final_next_states).max(1)[0]
+                next_state_values[non_final_mask] = self.target_net(non_final_next_states).max(1)[0].float()
                 
         # Compute the expected Q values: reward + gamma * max_a Q(s', a)        
         expected_state_action_values = (next_state_values * GAMMA) + reward_batch
 
         # Compute Huber loss
         criterion = nn.SmoothL1Loss() # Huber loss
-        loss = criterion(state_action_values, expected_state_action_values.unsqueeze(1))
+        loss = criterion(state_action_values.float(), expected_state_action_values.unsqueeze(1))
 
         # Optimize the model
         self.optimizer.zero_grad()
-        loss.backward()
-        # In-place gradient clipping
+        self.scaler.scale(loss).backward()
         torch.nn.utils.clip_grad_value_(self.policy_net.parameters(), 100)
-        self.optimizer.step()
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
         
         return loss.item() # Return loss for tracking
 
@@ -179,6 +183,8 @@ class DQNAgent:
             'policy_net_state_dict': self.policy_net.state_dict(),
             'target_net_state_dict': self.target_net.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
+            'steps_done': self.steps_done,
+            'scaler_state_dict': self.scaler.state_dict()
         }
         try:
             torch.save(checkpoint, filename)
@@ -192,7 +198,7 @@ class DQNAgent:
             return 0
 
         try:
-            checkpoint = torch.load(filename, map_location=self.device)
+            checkpoint = torch.load(filename, map_location='cpu')
             self.policy_net.load_state_dict(checkpoint['policy_net_state_dict'])
             self.target_net.load_state_dict(checkpoint['target_net_state_dict'])
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -203,6 +209,14 @@ class DQNAgent:
                 for k, v in state.items():
                     if isinstance(v, torch.Tensor):
                         state[k] = v.to(self.device)
+
+            self.steps_done = checkpoint.get('steps_done', start_episode * (BUFFER_SIZE / NUM_EPISODES))
+
+            if self.scaler.is_enabled() and 'scaler_state_dict' in checkpoint:
+                 self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
+                 print("Loaded GradScaler state.")
+            elif self.scaler.is_enabled():
+                 print("GradScaler state not found in checkpoint, initializing new scaler.")
 
             print(f"Checkpoint loaded from {filename}. Resuming from episode {start_episode + 1:,}")
             return start_episode
