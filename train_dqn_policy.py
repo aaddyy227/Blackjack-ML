@@ -12,15 +12,18 @@ import os
 # --- Configuration ---
 ENV_NAME = 'Blackjack-v1'
 MODEL_FILENAME = "blackjack_dqn_policy_50m.pth"
-NUM_EPISODES = 50_000_000  # <<< Increased to 50 Million episodes >>>
-BATCH_SIZE = 128        # Number of experiences to sample from buffer
-GAMMA = 0.99          # Discount factor
-EPS_START = 1.0       # Starting epsilon for exploration
-EPS_END = 0.05        # Minimum epsilon
-EPS_DECAY = 2_000_000 # <<< Increased decay steps for longer training >>>
-TAU = 0.005           # Soft update parameter for target network
-LR = 1e-4             # Learning rate for the optimizer
-BUFFER_SIZE = 500_000 # <<< Increased buffer size for longer training >>>
+CHECKPOINT_FILE = "dqn_checkpoint.pth"
+MANUAL_CHECKPOINT_TRIGGER = "save_checkpoint.trigger"
+NUM_EPISODES = 50_000_000
+BATCH_SIZE = 128
+GAMMA = 0.99
+EPS_START = 1.0
+EPS_END = 0.05
+EPS_DECAY = 2_000_000
+TAU = 0.005
+LR = 1e-4
+BUFFER_SIZE = 500_000
+CHECKPOINT_INTERVAL = 1_000_000
 
 # --- Define the Q-Network ---
 class DQN(nn.Module):
@@ -166,37 +169,71 @@ class DQNAgent:
     def save_model(self, filename=MODEL_FILENAME):
         try:
             torch.save(self.policy_net.state_dict(), filename)
-            print(f"Model saved successfully to {filename}")
+            print(f"\nFinal model saved successfully to {filename}")
         except Exception as e:
-            print(f"Error saving model: {e}")
+            print(f"\nError saving final model: {e}")
+
+    def save_checkpoint(self, filename, episode):
+        checkpoint = {
+            'episode': episode,
+            'policy_net_state_dict': self.policy_net.state_dict(),
+            'target_net_state_dict': self.target_net.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+        }
+        try:
+            torch.save(checkpoint, filename)
+            print(f"\nCheckpoint saved to {filename} at episode {episode:,}")
+        except Exception as e:
+            print(f"\nError saving checkpoint: {e}")
+
+    def load_checkpoint(self, filename):
+        if not os.path.exists(filename):
+            print(f"Checkpoint file {filename} not found. Starting from scratch.")
+            return 0
+
+        try:
+            checkpoint = torch.load(filename, map_location=self.device)
+            self.policy_net.load_state_dict(checkpoint['policy_net_state_dict'])
+            self.target_net.load_state_dict(checkpoint['target_net_state_dict'])
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            start_episode = checkpoint['episode']
+            self.policy_net.to(self.device)
+            self.target_net.to(self.device)
+            for state in self.optimizer.state.values():
+                for k, v in state.items():
+                    if isinstance(v, torch.Tensor):
+                        state[k] = v.to(self.device)
+
+            print(f"Checkpoint loaded from {filename}. Resuming from episode {start_episode + 1:,}")
+            return start_episode
+        except Exception as e:
+            print(f"Error loading checkpoint: {e}. Starting from scratch.")
+            return 0
 
 # --- Training Loop ---
 if __name__ == "__main__":
-    print(f"Starting DQN training for {NUM_EPISODES:,} episodes...") # Formatted number
-    # Setup device
+    print(f"Starting DQN training for {NUM_EPISODES:,} episodes...")
     if torch.cuda.is_available():
         device = torch.device("cuda")
         print(f"Using GPU: {torch.cuda.get_device_name(0)}")
-    # elif torch.backends.mps.is_available(): # For MacOS Metal
-    #     device = torch.device("mps")
-    #     print("Using MPS (Apple Silicon GPU)")
     else:
         device = torch.device("cpu")
         print("Using CPU")
 
-    env = gym.make(ENV_NAME) # Consider gym.make(ENV_NAME, sab=True) for slightly different rules if desired
+    env = gym.make(ENV_NAME)
     agent = DQNAgent(env, device)
+
+    start_episode = agent.load_checkpoint(CHECKPOINT_FILE)
+    agent.steps_done = start_episode * (BUFFER_SIZE / NUM_EPISODES)
 
     episode_rewards = []
     episode_losses = []
     start_time = time.time()
-    # Use a larger reporting interval due to huge episode count
     report_interval = 1000 
-    print_interval = 10000 # For newline
+    print_interval = 10000
 
-    for i_episode in range(NUM_EPISODES):
+    for i_episode in range(start_episode, NUM_EPISODES):
         state, _ = env.reset()
-        # state = tuple(state) # Ensure hashable if using dicts, but tensor conversion handles it
         
         done = False
         total_reward = 0
@@ -208,24 +245,18 @@ if __name__ == "__main__":
             action = action_tensor.item()
             
             next_state, reward, terminated, truncated, _ = env.step(action)
-            # next_state = tuple(next_state)
             done = terminated or truncated
             total_reward += reward
             
-            # Store the transition in memory
-            # Ensure next_state is None if done to handle terminal states correctly
             agent.memory.push(state, action_tensor, next_state if not done else None, reward, done)
             
-            # Move to the next state
             state = next_state
             
-            # Perform one step of the optimization (on the policy network)
             loss = agent.optimize_model()
             if loss is not None:
                  total_loss += loss
                  steps += 1
 
-            # Soft update of the target network's weights
             agent.update_target_network()
             
             if done:
@@ -235,33 +266,43 @@ if __name__ == "__main__":
         avg_loss = total_loss / steps if steps > 0 else 0
         episode_losses.append(avg_loss)
         
-        # Logging progress with updated intervals
+        if (i_episode + 1) % CHECKPOINT_INTERVAL == 0:
+            agent.save_checkpoint(CHECKPOINT_FILE, i_episode + 1)
+            
+        if os.path.exists(MANUAL_CHECKPOINT_TRIGGER):
+            manual_filename = f"manual_checkpoint_ep{i_episode + 1}.pth"
+            agent.save_checkpoint(manual_filename, i_episode + 1)
+            try:
+                os.remove(MANUAL_CHECKPOINT_TRIGGER)
+                print(f"\nRemoved trigger file: {MANUAL_CHECKPOINT_TRIGGER}")
+            except OSError as e:
+                print(f"\nError removing trigger file {MANUAL_CHECKPOINT_TRIGGER}: {e}")
+
         if (i_episode + 1) % report_interval == 0:
-            avg_reward = np.mean(episode_rewards[-report_interval:]) # Avg over report interval
+            avg_reward = np.mean(episode_rewards[-report_interval:])
             avg_loss_last_interval = np.mean(episode_losses[-report_interval:])
             elapsed_time = time.time() - start_time
-            time_per_episode = elapsed_time / (i_episode + 1)
-            est_total_time = time_per_episode * NUM_EPISODES
+            time_per_episode = elapsed_time / (i_episode + 1 - start_episode)
+            est_total_time = time_per_episode * (NUM_EPISODES - start_episode)
             est_remaining_time = est_total_time - elapsed_time
             
-            print(f"\rEpisode {i_episode+1:,}/{NUM_EPISODES:,} | Avg Reward ({report_interval} ep): {avg_reward:.3f} | Avg Loss: {avg_loss_last_interval:.5f} | Steps: {agent.steps_done:,} | Time: {elapsed_time:.1f}s | ETA: {est_remaining_time/3600:.1f} hrs", end="")
+            print(f"\rEpisode {i_episode+1:,}/{NUM_EPISODES:,} | Avg Reward ({report_interval} ep): {avg_reward:.3f} | Avg Loss: {avg_loss_last_interval:.5f} | Steps (Total Est): {agent.steps_done + (i_episode+1 - start_episode)*steps:.0f} | Time: {elapsed_time:.1f}s | ETA: {est_remaining_time/3600:.1f} hrs", end="")
         
         if (i_episode + 1) % print_interval == 0:
-             print() # Newline less frequently
+             print()
+
+    agent.save_model(MODEL_FILENAME)
+    print(f"\nTraining finished after {NUM_EPISODES:,} episodes.")
 
     env.close()
     total_training_time = time.time() - start_time
     print(f"\n\nTraining complete in {total_training_time:.2f} seconds ({total_training_time/3600:.2f} hours).")
     
-    # Save the trained policy network
-    agent.save_model()
-
-    # --- Optional: Plot results ---
     try:
         import matplotlib.pyplot as plt
         plt.figure(figsize=(12, 5))
         plt.subplot(1, 2, 1)
-        rewards_moving_avg = np.convolve(episode_rewards, np.ones(report_interval)//report_interval, mode='valid') # Smoothed over report interval
+        rewards_moving_avg = np.convolve(episode_rewards, np.ones(report_interval)//report_interval, mode='valid')
         plt.plot(rewards_moving_avg)
         plt.title(f'Episode Rewards (Moving Average {report_interval})')
         plt.xlabel('Episode')
@@ -277,9 +318,8 @@ if __name__ == "__main__":
         plt.grid(True)
         
         plt.tight_layout()
-        plt.savefig("dqn_training_plot_50m.png") # New plot filename
+        plt.savefig("dqn_training_plot_50m.png")
         print("Training plot saved to dqn_training_plot_50m.png")
-        # plt.show() # Don't show if running non-interactively
     except ImportError:
         print("Matplotlib not found. Skipping plot generation. Install with: pip install matplotlib")
     except Exception as e:
